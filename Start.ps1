@@ -105,8 +105,8 @@ function Read-Status {
     $file = Join-Path $script:sessionDir 'status.tsv'
     try {
         if (Test-Path -LiteralPath $file -PathType Leaf) {
-            $parts = ([IO.File]::ReadAllText($file)).TrimEnd([char[]]"`r`n") -split "`t", 6
-            if ($parts.Count -eq 6) { return ,$parts }
+            $parts = ([IO.File]::ReadAllText($file)).TrimEnd([char[]]"`r`n") -split "`t", 8
+            if ($parts.Count -eq 8) { return ,$parts }
         }
     } catch [IO.IOException] {
         return
@@ -119,7 +119,7 @@ function Test-Assistant([string]$source) {
     $deadline = [DateTime]::UtcNow.AddMinutes(6)
     while (-not $script:gameProcess.HasExited -and [DateTime]::UtcNow -lt $deadline) {
         $state = Read-Status
-        if ($state -and $state[0] -eq 'blocked') { throw "闯关暂停 $($state[5])" }
+        if ($state -and $state[0] -eq 'blocked') { throw "闯关暂停 $($state[7])" }
         $log = Join-Path $script:sessionDir 'events.tsv'
         if (Test-Path -LiteralPath $log) {
             $lines = Get-Content -LiteralPath $log -Encoding UTF8
@@ -229,9 +229,14 @@ function Show-Assistant([string]$source) {
         $state = Read-Status
         if (-not $state) { return }
         $status.Text = $labels[$state[0]]
-        $stats.Text = ('关卡 {0}    得分 {1}    剩余拼块 {2}' -f $state[1], $state[2], $state[3])
+        $stats.Text = if ($state[6]) {
+            ('关卡 {0}' -f $state[1]) + "`r`n" +
+                ('得分 {0} / {1}（三星）    当前 {2} 星    剩余拼块 {3}' -f $state[2], $state[6], $state[5], $state[3])
+        } else {
+            '关卡 {0}' -f $state[1]
+        }
         $location.Text = if ($state[0] -eq 'blocked') {
-            if ($reasons.ContainsKey($state[5])) { $reasons[$state[5]] } else { $state[5] }
+            if ($reasons.ContainsKey($state[7])) { $reasons[$state[7]] } else { $state[7] }
         } else { "本轮已结算 $($state[4]) 关" }
         $pause.Text = if ($state[0] -in 'blocked','paused') { '继续' } else { '暂停' }
         if ($state[0] -eq 'finished') { $pause.Enabled = $false }

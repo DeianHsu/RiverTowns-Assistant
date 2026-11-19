@@ -3,8 +3,10 @@ local session = assert(os.getenv("RIVER_ASSISTANT_SESSION"), "Missing assistant 
 local solver = dofile(assert(os.getenv("RIVER_ASSISTANT_SOURCE")) .. "/solver.lua")
 
 local attempts, cleared, cleared_count = {}, {}, 0
+local replay_level
 local world_id, phase, detail = nil, "waiting", ""
 local current_level, current_score, remaining = "", 0, 0
+local thresholds
 local pending, failed_move, shape_cache = nil, nil, {}
 local next_action, end_started, last_status = 0, nil, nil
 local gate_pending = false
@@ -13,13 +15,17 @@ local retry_limit = 6
 local back_button = "BndEvt__WID_EndScreen_WID_Button_K2Node_ComponentBoundEvent_0_OnClicked__DelegateSignature"
 local world_path = "/Game/EmpireBuilder/Game/Levels/Build/World_%s/LevelSelect/LVL_LevelSelect_World%s"
 local saves_class = "/Game/EmpireBuilder/Utils/BP_SaveGame_ExpandedBlueprintFunctionLibrary.Default__BP_SaveGame_ExpandedBlueprintFunctionLibrary_C"
+local gameplay_class = "/Game/EmpireBuilder/Utils/BP_Gameplay_ExpandedBlueprintFunctionLibrary.Default__BP_Gameplay_ExpandedBlueprintFunctionLibrary_C"
 
 local function present(object)
     return type(object) == "userdata" and type(object.IsValid) == "function" and object:IsValid()
 end
 
 local function unwrap(value)
-    if type(value) == "userdata" and value:type() == "LocalUnrealParam" then return value:get() end
+    if type(value) == "userdata" then
+        local kind = value:type()
+        if kind == "LocalUnrealParam" or kind == "RemoteUnrealParam" then return value:get() end
+    end
     return value
 end
 
@@ -49,9 +55,20 @@ local function widget(class)
     end
 end
 
+local function stars(score)
+    if not thresholds then return 0 end
+    for star = 3, 1, -1 do
+        if score >= thresholds[star] then return star end
+    end
+    return 0
+end
+
 local function write_status()
     local safe_detail = tostring(detail):gsub("[\t\r\n]", " ")
-    local data = table.concat({phase, current_level, current_score, remaining, cleared_count, safe_detail}, "\t")
+    local data = table.concat({
+        phase, current_level, current_score, remaining, cleared_count,
+        stars(current_score), thresholds and thresholds[3] or "", safe_detail,
+    }, "\t")
     if data == last_status then return end
     local file = io.open(session .. "/status.tsv", "w")
     if file then
@@ -94,40 +111,110 @@ local function placement(x, y, rotation)
     return {Location = {X = x, Y = y}, Rotation = rotation}
 end
 
+local function score_goals(world)
+    local lib = StaticFindObject(gameplay_class)
+    local row, found = {}, {}
+    lib:GetCurrentLevelData(world, row, found)
+    local scores = row.Score_48_71A74AD3415C97FD261A348AE3A32A77
+    if not found.Found or not scores then return end
+    local goals = {
+        scores.OneStarThreshold_2_5B9E4E95423FC83E56466EB6195BEDCB,
+        scores.TwoStarThreshold_6_0BB2EE9F46F1FE6B717C5F96FCEA8151,
+        scores.ThreeStarThreshold_7_9C4904E24A7C7DBC5279AFA3E4C35357,
+    }
+    if type(goals[1]) == "number" and type(goals[2]) == "number" and type(goals[3]) == "number" then
+        return goals
+    end
+end
+
 local function classify(descriptor, actor)
     local label = object_name(descriptor):lower() .. " " .. object_name(actor):lower()
-    local district = descriptor.DistrictType
-    if type(district) ~= "number" then district = nil end
-    if not district then
-        if label:find("labour") then district = "labour"
-        elseif label:find("residential") then district = "residential"
-        elseif label:find("worship") then district = "worship" end
-    end
-    local road = label:find("road") ~= nil or label:find("bridge") ~= nil
-    local water = label:find("river") ~= nil or label:find("water") ~= nil
-    local reward = 0
-    if label:find("gold") or label:find("crate") then reward = 10
-    elseif label:find("ruin") or label:find("tree") or label:find("geyser") then reward = 5 end
+    local kind = descriptor.DistrictType
+    local district = type(kind) == "number" and kind >= 0 and kind <= 2 and kind or nil
+    local connector = kind == 3 or label:find("bridge") ~= nil or label:find("road") ~= nil
+    local neighbor = descriptor.NeighbourScore
+    local cover, touch = 0, 0
+    if label:find("treasure") or label:find("gold") then cover = 10
+    elseif label:find("buildingmaterials") then cover = 30
+    elseif label:find("geyser") and not label:find("mother") then
+        cover = present(actor) and actor.IsActive == true and 28 or 11
+    elseif label:find("crate") then cover = 8 end
+    if label:find("tree") then touch = 4.5
+    elseif label:find("temple") or label:find("lighthouse") then touch = 5
+    elseif label:find("ruin") then touch = 1.5 end
     return {
-        district = district or (road and "road" or nil),
-        road = road, water = water, solid = not descriptor.CanBeSquished,
-        reward = reward, actor = present(actor) and actor:GetAddress() or nil,
+        district = district, connector = connector, building = district ~= nil or connector,
+        start = object_name(descriptor) == "GridEntity_Start",
+        water = label:find("river") ~= nil, solid = not descriptor.CanBeSquished,
+        neighbor = type(neighbor) == "number" and neighbor or 0,
+        cover = cover, touch = touch, actor = present(actor) and actor:GetAddress() or nil,
+        objective = label:find("temple") and "temple" or (label:find("tree") and "tree" or nil),
     }
 end
 
+local function cell_index(board, cell)
+    if cell.X >= 0 and cell.Y >= 0 and cell.X < board.width and cell.Y < board.height then
+        return cell.Y * board.width + cell.X + 1
+    end
+end
+
+local function add_objective(board, actor, tile, anchor)
+    if not tile.objective or not anchor or type(actor.IsGrown) ~= "boolean" then return end
+    if actor.IsGrown then tile.touch = 0; return end
+    local neighbors = actor.NeighbourCells
+    if type(neighbors) ~= "userdata" or neighbors:type() ~= "TArray" then return end
+    local cells, seen = {}, {}
+    for i = 1, #neighbors do
+        local index = cell_index(board, unwrap(neighbors[i]))
+        if index and not seen[index] then
+            seen[index] = true
+            cells[#cells + 1] = index
+        end
+    end
+    if #cells == 0 then return end
+    if tile.objective == "tree" then tile.cover = -16 end
+    tile.touch = 0
+    -- 庙宇的每个本体格都要围住。NeighbourCells 给出整个外圈。
+    local objective = {cells = cells, need = #cells, kind = tile.objective, anchor = anchor, tile = tile}
+    board.objectives[#board.objectives + 1] = objective
+    for _, index in ipairs(cells) do
+        local related = board.objectives_at[index] or {}
+        related[#related + 1] = objective
+        board.objectives_at[index] = related
+    end
+end
+
 local function get_board(grid)
-    local board = {width = grid.GridColumns, height = grid.GridRows, tiles = {}}
+    local board = {
+        width = grid.GridColumns, height = grid.GridRows, tiles = {},
+        objectives = {}, objectives_at = {},
+    }
     for _, item in ipairs(grid:GetAllGridActors()) do
         local actor = unwrap(item)
         if present(actor) and present(actor.GridEntityDescriptor) then
             local category = classify(actor.GridEntityDescriptor, actor)
+            local anchor
             for _, point in ipairs(grid:GetGridActorCells(actor)) do
-                local cell = unwrap(point)
-                local index = cell.Y * board.width + cell.X + 1
-                local old = board.tiles[index]
-                if not old or category.solid or not old.solid then board.tiles[index] = category end
+                local index = cell_index(board, unwrap(point))
+                if index then
+                    anchor = anchor or index
+                    local old = board.tiles[index]
+                    if not old or category.building or category.start
+                            or (not old.building and not old.start and category.solid) then
+                        board.tiles[index] = category
+                    end
+                end
             end
+            add_objective(board, actor, category, anchor)
         end
+    end
+    local temples = 0
+    for _, goal in ipairs(board.objectives) do
+        if goal.kind == "temple" then temples = temples + 1 end
+    end
+    for _, goal in ipairs(board.objectives) do
+        -- 庙宇完成后乘数增加 0.2，用三星门槛换算本局中这个乘数的大致价值。
+        goal.reward = goal.kind == "tree" and 20 or (thresholds and thresholds[3] or 300) * 0.2 / (1 + 0.2 * temples)
     end
     return board
 end
@@ -137,6 +224,7 @@ local function get_piece(grid, descriptor)
     local key = descriptor:GetAddress()
     if shape_cache[key] then return shape_cache[key] end
     local piece = classify(descriptor)
+    piece.cover, piece.touch = 0, 0
     piece.rotations = {}
     for rotation = 0, 3 do
         local offsets = {}
@@ -150,6 +238,26 @@ local function get_piece(grid, descriptor)
     end
     shape_cache[key] = piece
     return piece
+end
+
+local function neighbor_preview(world, board)
+    for _, scorer in ipairs(FindAllOf("AutoScoring_NeighbourScoring_C") or {}) do
+        if present(scorer) then
+            local owner = scorer:GetOuter()
+            local level = present(owner) and owner:GetOuter()
+            if present(level) and level:GetAddress() == world:GetAddress() then
+                return function(move)
+                    local cells = {}
+                    for i, cell in ipairs(move.cells) do
+                        cells[i] = {X = (cell - 1) % board.width, Y = (cell - 1) // board.width}
+                    end
+                    local points = {}
+                    scorer:CalculateScore(cells, {}, points, {}, {})
+                    return points.Score
+                end
+            end
+        end
+    end
 end
 
 local function close_tutorial(world)
@@ -196,7 +304,8 @@ local function cross_gate(world, gate)
 end
 
 local function level_select(world)
-    local unplayed, retries = {}, {}
+    local unplayed, upgrades, retries = {}, {}, {}
+    local replay
     local unfinished = 0
     for _, target in ipairs(world_objects("BP_LevelSelectWorldObject_C", world)) do
         local level = target:GetLevelName():ToString()
@@ -205,18 +314,32 @@ local function level_select(world)
             local tries = attempts[level] or 0
             if target.IsUnlocked and tries < retry_limit then
                 local option = {target = target, level = level, stars = target.StarCount, tries = tries}
-                if not target.IsCompleted and tries == 0 then unplayed[#unplayed + 1] = option
-                else retries[#retries + 1] = option end
+                if level == replay_level and tries == 1 and option.stars < 3 then
+                    replay = option
+                elseif not target.IsCompleted and tries == 0 then
+                    unplayed[#unplayed + 1] = option
+                elseif option.stars < 3 and tries == 0 then
+                    upgrades[#upgrades + 1] = option
+                elseif option.stars < 3 then
+                    retries[#retries + 1] = option
+                end
             end
         end
     end
-    if current_level:match("World04$") and unfinished == 0 then
-        phase, detail, command = "finished", "campaign", "pause"
+    replay_level = nil
+    if replay then
+        go_to(replay.target, replay.level)
         return
     end
+    table.sort(upgrades, function(a, b) return a.level < b.level end)
     table.sort(unplayed, function(a, b) return a.level < b.level end)
-    if unplayed[1] then
-        go_to(unplayed[1].target, unplayed[1].level)
+    local next_level = upgrades[1] or unplayed[1]
+    if next_level then
+        go_to(next_level.target, next_level.level)
+        return
+    end
+    if current_level:match("World04$") and unfinished == 0 then
+        phase, detail, command = "finished", "campaign", "pause"
         return
     end
     for _, gate in ipairs(world_objects("BP_LevelSelectGate_C", world)) do
@@ -261,6 +384,11 @@ local function ending(world, controller, score)
     end
     event("settled", current_level, score)
     event("recorded", current_level, recorded.Score or 0)
+    if thresholds then
+        local achieved = stars(recorded.Score or 0)
+        event("stars", current_level, achieved .. "/3 " .. (recorded.Score or 0) .. "/" .. thresholds[3])
+        if achieved < 3 and attempts[current_level] == 1 then replay_level = current_level end
+    end
     screen[back_button](screen, screen.LevelSelectButton)
     phase, detail, next_action = "travel", "return", os.time() + 12
 end
@@ -270,8 +398,10 @@ local function play(world, controller)
     local grid = world_objects("GameWorldGrid", world, true)[1]
     local scoring = world_objects("ScoreSubsystem", world, true)[1]
     if not (present(state) and present(cursor) and grid and scoring) then return end
-    remaining = #state.ShapeStack
+    local stack = state.ShapeStack
+    remaining = #stack
     current_score = scoring:CalculateTotalScore()
+    if not thresholds then thresholds = score_goals(world) end
     local mode = world.AuthorityGameMode
     if present(mode) and mode.bHasGameEnded == true then
         ending(world, controller, current_score)
@@ -296,17 +426,22 @@ local function play(world, controller)
     close_tutorial(world)
     local piece = get_piece(grid, descriptor)
     if not piece then fail("shape-unavailable"); return end
-    local upcoming = {}
-    for i = 1, math.min(remaining - 1, 2) do
-        local future = get_piece(grid, unwrap(state.ShapeStack[remaining - i]))
-        if future then upcoming[#upcoming + 1] = future end
+    local upcoming, has_single = {}, false
+    for i = 1, remaining - 1 do
+        local future = get_piece(grid, unwrap(stack[remaining - i]))
+        if future then
+            if i <= 7 then upcoming[#upcoming + 1] = future end
+            if #future.rotations[1] == 1 then has_single = true end
+        end
     end
-    local move = solver.choose(get_board(grid), piece, upcoming, math.max((attempts[current_level] or 1) - 1, 0),
+    local board = get_board(grid)
+    board.has_single = has_single
+    local move = solver.choose(board, piece, upcoming, math.max((attempts[current_level] or 1) - 1, 0),
         function(option)
             if failed_move and option.x == failed_move.x and option.y == failed_move.y
                     and option.rotation == failed_move.rotation then return false end
             return grid:CanPlaceShape(descriptor, placement(option.x, option.y, option.rotation), {}) == 0
-        end)
+        end, neighbor_preview(world, board))
     pending = {move = move, count = remaining, descriptor = descriptor:GetAddress(), deadline = os.time() + 4}
     if not move then
         if failed_move then fail("placement-rejected"); return end
@@ -337,6 +472,7 @@ local function step()
         world_id = world:GetAddress()
         current_level = object_name(world)
         current_score, remaining, next_action = 0, 0, os.time() + 2
+        thresholds = nil
         pending, failed_move, shape_cache, end_started, gate_pending = nil, nil, {}, nil, false
         phase, detail = "loading", ""
         event("world", current_level)
