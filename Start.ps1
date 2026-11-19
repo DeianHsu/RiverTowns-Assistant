@@ -183,6 +183,13 @@ function Show-Assistant([string]$source) {
         'settlement-timeout'='等待结算超时。'
         'score-not-saved'='游戏尚未写入本关成绩。'
     }
+    $activities = @{
+        'read-save'='读取助手存档'
+        'upgrade'='补刷已通关的低星关卡'
+        'new-level'='挑战尚未通关的关卡'
+        'retry'='换一种摆法重试'
+        'gate-retry'='为解锁世界门补星'
+    }
 
     $start.Add_Click({
         try {
@@ -237,6 +244,8 @@ function Show-Assistant([string]$source) {
         }
         $location.Text = if ($state[0] -eq 'blocked') {
             if ($reasons.ContainsKey($state[7])) { $reasons[$state[7]] } else { $state[7] }
+        } elseif ($activities.ContainsKey($state[7])) {
+            "$($activities[$state[7]])    本轮已结算 $($state[4]) 关"
         } else { "本轮已结算 $($state[4]) 关" }
         $pause.Text = if ($state[0] -in 'blocked','paused') { '继续' } else { '暂停' }
         if ($state[0] -eq 'finished') { $pause.Enabled = $false }

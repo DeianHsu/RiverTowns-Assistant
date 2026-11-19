@@ -3,7 +3,7 @@ local session = assert(os.getenv("RIVER_ASSISTANT_SESSION"), "Missing assistant 
 local solver = dofile(assert(os.getenv("RIVER_ASSISTANT_SOURCE")) .. "/solver.lua")
 
 local attempts, cleared, cleared_count = {}, {}, 0
-local replay_level
+local skipped, selected, replay_level = {}, nil, nil
 local world_id, phase, detail = nil, "waiting", ""
 local current_level, current_score, remaining = "", 0, 0
 local thresholds
@@ -64,7 +64,11 @@ local function stars(score)
 end
 
 local function write_status()
-    local safe_detail = tostring(detail):gsub("[\t\r\n]", " ")
+    local activity = detail
+    if activity == "" and selected and selected.level == current_level then
+        activity = selected.activity
+    end
+    local safe_detail = tostring(activity):gsub("[\t\r\n]", " ")
     local data = table.concat({
         phase, current_level, current_score, remaining, cleared_count,
         stars(current_score), thresholds and thresholds[3] or "", safe_detail,
@@ -266,12 +270,15 @@ local function close_tutorial(world)
     end
 end
 
-local function go_to(target, level)
+local function go_to(option, activity)
+    local target, level = option.target, option.level
     attempts[level] = (attempts[level] or 0) + 1
+    selected = {level = level, activity = activity}
     target:Select(false)
     target:Start()
-    phase, detail, next_action = "travel", level, os.time() + 5
+    phase, detail, next_action = "travel", activity, os.time() + 5
     event("enter", level, attempts[level])
+    event("select", level, activity)
 end
 
 local function open_world(world, number)
@@ -310,32 +317,40 @@ local function level_select(world)
     for _, target in ipairs(world_objects("BP_LevelSelectWorldObject_C", world)) do
         local level = target:GetLevelName():ToString()
         if not target.IsCompetitionLevel and level ~= "None" then
-            if not target.IsCompleted then unfinished = unfinished + 1 end
-            local tries = attempts[level] or 0
-            if target.IsUnlocked and tries < retry_limit then
-                local option = {target = target, level = level, stars = target.StarCount, tries = tries}
-                if level == replay_level and tries == 1 and option.stars < 3 then
-                    replay = option
-                elseif not target.IsCompleted and tries == 0 then
-                    unplayed[#unplayed + 1] = option
-                elseif option.stars < 3 and tries == 0 then
-                    upgrades[#upgrades + 1] = option
-                elseif option.stars < 3 then
-                    retries[#retries + 1] = option
+            local saved_stars = target.StarCount
+            if saved_stars >= 3 then
+                if not skipped[level] then
+                    skipped[level] = true
+                    event("skip", level, saved_stars)
+                end
+            else
+                local completed = target.IsCompleted
+                if not completed then unfinished = unfinished + 1 end
+                local tries = attempts[level] or 0
+                if target.IsUnlocked and tries < retry_limit then
+                    local option = {target = target, level = level, stars = saved_stars, tries = tries}
+                    if level == replay_level and tries == 1 then
+                        replay = option
+                    elseif tries == 0 then
+                        local queue = completed and upgrades or unplayed
+                        queue[#queue + 1] = option
+                    else
+                        retries[#retries + 1] = option
+                    end
                 end
             end
         end
     end
     replay_level = nil
     if replay then
-        go_to(replay.target, replay.level)
+        go_to(replay, "retry")
         return
     end
     table.sort(upgrades, function(a, b) return a.level < b.level end)
     table.sort(unplayed, function(a, b) return a.level < b.level end)
     local next_level = upgrades[1] or unplayed[1]
     if next_level then
-        go_to(next_level.target, next_level.level)
+        go_to(next_level, upgrades[1] and "upgrade" or "new-level")
         return
     end
     if current_level:match("World04$") and unfinished == 0 then
@@ -354,7 +369,7 @@ local function level_select(world)
         return a.level < b.level
     end)
     if retries[1] then
-        go_to(retries[1].target, retries[1].level)
+        go_to(retries[1], "gate-retry")
     else
         fail("gate-locked")
     end
@@ -483,7 +498,7 @@ local function step()
         phase, detail, command = "finished", "campaign", "pause"
     elseif controller_class == "BP_PlayerController_MainMenu_C" then
         open_world(world, "01")
-        phase, detail, next_action = "travel", "story", os.time() + 12
+        phase, detail, next_action = "travel", "read-save", os.time() + 12
     elseif current_level:find("LVL_LevelSelect_", 1, true) then
         level_select(world)
     elseif controller_class == "PlayerController_EmpireBuilder_C" then
