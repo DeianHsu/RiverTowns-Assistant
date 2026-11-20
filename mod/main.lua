@@ -1,9 +1,13 @@
 local UEHelpers = require("UEHelpers")
-local session = assert(os.getenv("RIVER_ASSISTANT_SESSION"), "Missing assistant session")
-local solver = dofile(assert(os.getenv("RIVER_ASSISTANT_SOURCE")) .. "/solver.lua")
-local probe_path = os.getenv("RIVER_ASSISTANT_PROBE")
+local settings = ...
+if type(settings) ~= "table" then settings = {} end
+local session = assert(settings.session or os.getenv("RIVER_ASSISTANT_SESSION"), "Missing assistant session")
+local source = assert(settings.source or os.getenv("RIVER_ASSISTANT_SOURCE"))
+local live = settings.live and dofile(source .. "/live.lua").connect(session, source .. "/levels.tsv") or nil
+local solver = dofile(source .. "/solver.lua")
+local probe_path = not live and os.getenv("RIVER_ASSISTANT_PROBE")
 local probe = probe_path and probe_path ~= "" and dofile(probe_path) or nil
-local mode = os.getenv("RIVER_ASSISTANT_MODE")
+local mode = not live and os.getenv("RIVER_ASSISTANT_MODE")
 local managed = mode == "campaign" or mode == "trial"
 local locked_level = os.getenv("RIVER_ASSISTANT_TARGET") or ""
 local locked_world = os.getenv("RIVER_ASSISTANT_WORLD") or ""
@@ -18,7 +22,7 @@ local current_level, current_score, remaining = "", 0, 0
 local thresholds
 local pending, failed_moves, stall_count, shape_cache = nil, {}, 0, {}
 local monument_targets = {}
-local next_action, end_started, last_status = 0, nil, nil
+local next_action, end_started, last_status, status_time = 0, nil, nil, 0
 local gate_pending = false
 local command, epoch = "", ""
 local retry_limit = 6
@@ -79,16 +83,21 @@ local function write_status()
         activity = selected.activity
     end
     local safe_detail = tostring(activity):gsub("[\t\r\n]", " ")
-    local data = table.concat({
+    local fields = {
         phase, current_level, current_score, remaining, cleared_count,
         stars(current_score), thresholds and thresholds[3] or "", safe_detail,
-    }, "\t")
-    if data == last_status then return end
+    }
+    if live then
+        fields[9], fields[10], fields[11], fields[12] = live.id, live.current, live.serial, live.job and live.job.kind or ""
+    end
+    local data = table.concat(fields, "\t")
+    local now = os.time()
+    if data == last_status and (not live or now == status_time) then return end
     local file = io.open(session .. "/status.tsv", "w")
     if file then
         file:write(data, "\n")
         file:close()
-        last_status = data
+        last_status, status_time = data, now
     end
 end
 
@@ -117,6 +126,7 @@ local function read_command()
 end
 
 local function fail(message)
+    if live then live.job = nil end
     phase, detail, command = "blocked", message, "pause"
     event("blocked", current_level, tostring(message):gsub("[\t\r\n]", " "))
 end
@@ -446,14 +456,9 @@ local function neighbor_preview(world, board)
 end
 
 local function close_tutorial(world)
-    local busy = false
     for _, popup in ipairs(world_objects("BP_TutorialPopup_C", world)) do
-        if popup.IsShown then
-            busy = true
-            if popup.CanBeClosed then popup:DestroyPopup() end
-        end
+        if popup.IsShown and popup.CanBeClosed then popup:DestroyPopup() end
     end
-    return busy
 end
 
 local function go_to(option, activity)
@@ -629,6 +634,30 @@ local function return_to_map(screen)
     phase, detail, next_action = "travel", "return", os.time() + 12
 end
 
+local function expect_live_map(number)
+    live.job.destination = "LVL_LevelSelect_World" .. number
+    live.job.deadline = os.time() + 25
+end
+
+local function finish_live_level(screen, recorded_stars)
+    local job = live.job
+    if recorded_stars >= 3 then
+        if job.kind == "single" or job.index == #live.levels then
+            phase, detail, live.job = "finished", job.kind, nil
+            return
+        end
+        job.index = job.index + 1
+    elseif attempts[current_level] >= 2 then
+        phase, detail, live.job = "paused", "two-misses", nil
+        event("review", current_level, "two-misses")
+        return
+    end
+    job.stage = "route"
+    expect_live_map(selected.world)
+    return_to_map(screen)
+    if recorded_stars < 3 then detail = "retry" end
+end
+
 local function log_score_parts(scoring)
     for _, item in ipairs(scoring:GetAddScoringFunctions() or {}) do
         local rule = unwrap(item)
@@ -669,6 +698,11 @@ local function ending(world, controller, score, scoring)
         event("stars", current_level, achieved .. "/3 " .. (recorded.Score or 0) .. "/" .. thresholds[3])
         if achieved < 3 and attempts[current_level] == 1 then replay_level = current_level end
     end
+    if live then
+        current_score = score
+        finish_live_level(screen, stars(recorded.Score or 0))
+        return
+    end
     if managed then
         if not (selected and selected.level == current_level and thresholds and thresholds[3] > 0) then
             fail("campaign-score-unavailable")
@@ -701,7 +735,8 @@ local function play(world, controller)
     end
     if probe and probe.on_play then pcall(probe.on_play, session, world, controller, state, cursor, grid, scoring, remaining) end
     phase, detail = "solving", ""
-    if close_tutorial(world) then return end
+    -- 教学弹窗的显示状态可能延迟更新，能否落子由游戏控制器判定。
+    close_tutorial(world)
     if state.bIsInScoringSequence or cursor.PlaceShapeTimeline:IsPlaying() then return end
     if controller.BlockCanPlaceShape == true then return end
     local descriptor = state:PeekNextShape()
@@ -955,6 +990,8 @@ local function play(world, controller)
             move = solver.choose(board, piece, upcoming, variant, legal, neighbor_preview(world, board))
         end
     end
+    -- 求解期间可能收到停止指令，落子前重新确认这次闯关仍有效。
+    if live and live:request() ~= live.serial then return end
     pending = {
         move = move, count = remaining, descriptor = descriptor:GetAddress(),
         deadline = os.time() + 5, retried = stall_count > 0,
@@ -978,7 +1015,156 @@ local function play(world, controller)
     event("place", current_level, string.format("%d,%d,%d,%d", move.x, move.y, move.rotation, remaining))
 end
 
+local function observe_world(world)
+    local level = object_name(world)
+    if world:GetAddress() == world_id and current_level == level then return false end
+    world_id, current_level = world:GetAddress(), level
+    current_score, remaining, next_action = 0, 0, os.time() + 2
+    thresholds = nil
+    pending, failed_moves, stall_count, shape_cache, end_started, gate_pending = nil, {}, 0, {}, nil, false
+    monument_targets = {}
+    phase, detail = "loading", ""
+    event("world", current_level)
+    return true
+end
+
+local function stop_live(controller, reason)
+    if pending and present(controller) then
+        local cursor = controller.WorldCursor
+        if present(cursor) then cursor:SetIsPlacePressed(false) end
+    end
+    live.job, pending, selected = nil, nil, nil
+    phase, detail = "paused", reason
+    event("stopped", current_level, reason)
+end
+
+local function inspect_live_page(world, controller, playable)
+    live.current = playable and live.by_name[current_level] and current_level or ""
+    if live.current == "" and current_level:match("^LVL_LevelSelect_World0[1-4]$") then
+        for _, target in ipairs(world_objects("BP_LevelSelectWorldObject_C", world)) do
+            if target.IsSelected and target.IsUnlocked and not target.IsCompetitionLevel then
+                local level = target:GetLevelName():ToString()
+                if live.by_name[level] then live.current = level; break end
+            end
+        end
+    end
+    if not live.job and playable and os.time() >= next_action and (phase == "idle" or phase == "paused") then
+        local state = controller.PlayerState
+        local scoring = world_objects("ScoreSubsystem", world, true)[1]
+        if present(state) and scoring then
+            remaining = #state.ShapeStack
+            current_score = scoring:CalculateTotalScore()
+            if not thresholds then thresholds = score_goals(world) end
+        end
+    end
+end
+
+local function begin_live_job(action, target, world, controller, playable)
+    local entry = action == "first" and live.levels[1] or live.by_name[target]
+    if action ~= "first" and action ~= "current" and action ~= "single" then return end
+    if action == "current" and target ~= live.current then fail("live-current-changed"); return end
+    if not entry then fail("live-target-missing"); return end
+    if live.job then stop_live(controller, "stopped") end
+    attempts, cleared, cleared_count = {}, {}, 0
+    pending, selected, failed_moves, stall_count, end_started, gate_pending = nil, nil, {}, 0, nil, false
+    local adopt = action == "current" and playable and entry.level == current_level
+        and present(world.AuthorityGameMode) and world.AuthorityGameMode.bHasGameEnded ~= true
+    live.job = {kind = action, index = entry.index, stage = adopt and "play" or "route"}
+    phase, detail = "ready", action
+    if adopt then
+        attempts[current_level] = 1
+        attempt_number = attempt_number + 1
+        selected = {level = current_level, world = entry.world, number = attempt_number, activity = "current", variant = 0}
+    end
+    event("live-start", entry.level, action)
+end
+
+local function route_live(world, controller, entry)
+    local here = current_level:match("^LVL_LevelSelect_World(0[1-4])$")
+    if here == entry.world then
+        for _, target in ipairs(world_objects("BP_LevelSelectWorldObject_C", world)) do
+            if not target.IsCompetitionLevel and target:GetLevelName():ToString() == entry.level then
+                if not target.IsUnlocked then fail("live-target-locked"); return end
+                go_to({target = target, level = entry.level}, attempts[entry.level] and "retry" or live.job.kind)
+                live.job.stage, live.job.destination, live.job.deadline = "enter", entry.level, os.time() + 25
+                return
+            end
+        end
+        fail("live-target-missing")
+    elseif here and here < entry.world then
+        for _, gate in ipairs(world_objects("BP_LevelSelectGate_C", world)) do
+            if gate.IsUnlocked then
+                expect_live_map(string.format("%02d", tonumber(here) + 1))
+                cross_gate(world, gate)
+                return
+            end
+        end
+        fail("live-gate-locked")
+    else
+        local current = live.by_name[current_level]
+        local origin = here or (current and current.world) or "01"
+        local destination = origin < entry.world and origin or entry.world
+        local ended = current and present(world.AuthorityGameMode) and world.AuthorityGameMode.bHasGameEnded == true
+        if ended and destination == current.world then
+            local screen = widget("WID_EndScreen_C")
+            if not (screen and present(screen.LevelSelectButton) and present(screen.EndButtons)
+                    and screen.EndButtons:IsVisible() and screen.LevelSelectButton:IsVisible()
+                    and not controller.DoingScoreCountup) then
+                phase, detail = "settling", ""
+                return
+            end
+            expect_live_map(destination)
+            return_to_map(screen)
+        else
+            expect_live_map(destination)
+            open_world(world, destination)
+            phase, detail = "travel", "read-save"
+        end
+    end
+end
+
+local function live_step()
+    local serial, action, target = live:request()
+    local world, controller = UEHelpers.GetWorld(), UEHelpers.GetPlayerController()
+    if live.job and not serial then stop_live(controller, "connection-lost") end
+    if serial and serial ~= live.serial and action == "stop" then
+        live.serial = serial
+        if live.job then stop_live(controller, "stopped") end
+    end
+    if not present(world) or not present(controller) then
+        if live.job and live.job.deadline and os.time() >= live.job.deadline then fail("live-travel-timeout") end
+        return
+    end
+    local changed = observe_world(world)
+    if not live.job and (changed or phase == "waiting") then phase, detail = "idle", "" end
+    local playable = object_name(controller:GetClass()) == "PlayerController_EmpireBuilder_C"
+    inspect_live_page(world, controller, playable)
+    if serial and serial ~= live.serial then
+        live.serial = serial
+        begin_live_job(action, target, world, controller, playable)
+    end
+    local job = live.job
+    if not job then return end
+    if job.destination then
+        if current_level ~= job.destination then
+            if os.time() >= job.deadline then fail("live-travel-timeout") end
+            return
+        end
+        job.destination, job.deadline = nil, nil
+        if job.stage == "enter" then job.stage = "play" end
+    end
+    if os.time() < next_action then return end
+    local entry = live.levels[job.index]
+    if job.stage == "play" then
+        if not playable or current_level ~= entry.level then fail("live-game-changed"); return end
+        play(world, controller)
+    else
+        route_live(world, controller, entry)
+    end
+end
+
 local function step()
+    if live then live_step(); return end
     read_command()
     if managed and stop_path then
         local stop = io.open(stop_path, "r")
@@ -1007,16 +1193,7 @@ local function step()
     local world = UEHelpers.GetWorld()
     local controller = UEHelpers.GetPlayerController()
     if not present(world) or not present(controller) then phase = "loading"; return end
-    if world:GetAddress() ~= world_id then
-        world_id = world:GetAddress()
-        current_level = object_name(world)
-        current_score, remaining, next_action = 0, 0, os.time() + 2
-        thresholds = nil
-        pending, failed_moves, stall_count, shape_cache, end_started, gate_pending = nil, {}, 0, {}, nil, false
-        monument_targets = {}
-        phase, detail = "loading", ""
-        event("world", current_level)
-    end
+    observe_world(world)
     if os.time() < next_action then return end
     local controller_class = object_name(controller:GetClass())
     if current_level == "LVL_Credits" then

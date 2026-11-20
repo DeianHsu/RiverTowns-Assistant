@@ -4,23 +4,26 @@ Windows 桌面助手，通过《河畔小镇》（River Towns）的内部接口�
 
 ## 启动
 
-1. 在 Steam 中安装《河畔小镇》。
-2. 双击 `Start.cmd`，点击 **启动闯关**。程序会查找 Steam 库。也可以用 `Start.cmd -GamePath "游戏安装目录"` 指定位置。
-3. 在助手窗口查看关卡、当前分数、三星门槛和剩余拼块。可点击 **暂停** 或 **继续**。
+1. 首次使用时，退出游戏并双击 `Start.cmd`，点击 **安装连接组件**。助手会查找 Steam 库。也可以用 `Start.cmd -InstallSteamBridge -GamePath "游戏安装目录"` 手动安装。
+2. 在 Steam 中启动《河畔小镇》，然后双击 `Start.cmd`。助手会连接已经打开的游戏，并在独立窗口显示进度。
+3. 选择闯关方式。游戏会将结算成绩保存到当前使用的 Steam 存档。
 
-第一次运行需要约 1.1 GB 空间来准备本地游戏副本。程序使用 UE4SS v4.0.0。如果自动下载失败，将官方发行包 `UE4SS_v4.0.0.zip` 放到 `.river-runtime` 后重试。[UE4SS 官方发行页](https://github.com/UE4SS-RE/RE-UE4SS/releases/tag/v4.0.0)
+- **从头闯关** 从第一世界第一关重新开始，按关卡顺序推进，原有最高分仍由游戏保留。
+- **从当前关卡开始闯关** 在游戏中进入关卡或在选关地图上选中关卡后可用。已经摆放过的棋盘会接着打，结算后继续下一关。
+- **闯指定关** 从下拉列表选择一关。此模式只挑战所选关卡，结束后留在结算画面。游戏尚未解锁所选关卡时，助手会停止并显示原因。
+- **停止** 结束本轮自动摆放，保留游戏窗口和当前棋盘。关闭助手窗口也会结束本轮闯关。
 
-## 进度和日志
+连续两局后，若该关仍未取得三星，助手会停在结算画面供复盘。需要查看本轮选关、摆放和结算记录时，可打开 `.river-runtime/live/events.tsv`。
 
-本地副本以本地模式运行，存档位于 `.river-runtime/profile`。重新启动时会从第一世界的选关页面读取这份存档。每次启动的状态和动作日志保存在 `.river-runtime/run-*/status.tsv` 和 `.river-runtime/run-*/events.tsv`。
+连接组件使用 UE4SS v4.0.0，在 Steam 游戏目录的 `EmpireBuilder/Binaries/Win64` 中安装 `dwmapi.dll` 和 `override.txt`。运行文件保存在 `.river-runtime/live-bridge`。如果自动下载失败，可将官方发行包 `UE4SS_v4.0.0.zip` 放到 `.river-runtime` 后重试。[UE4SS 官方发行页](https://github.com/UE4SS-RE/RE-UE4SS/releases/tag/v4.0.0)
 
 助手读取已放建筑、障碍和待放拼块，用游戏的计分预览比较当前落点，并根据关卡向后搜索。搜索兼顾同色连片、跨河连接、树木复苏、遗迹修复和腐化围堵，并给后续拼块留下可用空间。每次实际落子都由游戏校验。
 
-助手会自动跳过存档中已有三星的关卡，优先补刷当前世界的低星关卡，再挑战尚未通关的关卡。窗口会显示本次选关是补星、挑战新关还是重试。某关首次结算低于三星会换一套摆法尝试一次，成绩由游戏按最高分保存。世界门缺星时会继续补分，达到重试上限后暂停并显示原因。
-
-## 全三星闯关
+## 命令行全三星闯关
 
 `Start.cmd -Campaign` 静音运行全三星模式。助手按世界顺序跳过已满星的关卡，直到当前世界的内置关卡全部三星才会过门。首局低于三星会重试同一关。连续两局低于三星会保存结算记录、退出游戏，等待复盘更新。关卡、计数和待复盘状态保存在 `.river-runtime/campaign/state.json`。
+
+命令行模式首次运行需要约 1.1 GB 空间准备游戏副本。副本的默认存档位于 `.river-runtime/profile`，每次启动的状态和动作记在 `.river-runtime/run-*` 中。
 
 `Start.cmd -Campaign -SteamSave -Visible` 从 Steam 安装版使用的本地正式存档续打，并显示独立的静音游戏窗口。启动前请退出正在运行的游戏。闯关状态保存在 `.river-runtime/campaign-steam/state.json`。复盘后可加上 `-Resume` 继续，或用 `Start.cmd -StopCampaign -SteamSave` 停止。
 
