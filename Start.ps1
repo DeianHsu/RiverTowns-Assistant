@@ -70,11 +70,21 @@ function Install-Assistant([string]$source) {
     }
     $copy = Join-Path $runtime 'game'
     $bin = Join-Path $copy $relativeBin
+    $introMovies = @('UE_moving_logo_v01_4k.mp4', 'FrogIntro_02.mp4', 'Metaroot_Logo_SplashScreen.mp4', 'StrayFawnSplash.mp4')
     New-Item -ItemType Directory -Path $copy -Force | Out-Null
     if ([IO.Path]::GetFullPath($source).TrimEnd('\') -ne [IO.Path]::GetFullPath($copy).TrimEnd('\')) {
+        $excluded = @('override.txt', 'dwmapi.dll') + $introMovies
         & robocopy.exe $source $copy /E /XJ /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP `
-            /XF override.txt dwmapi.dll /XD ue4ss | Out-Null
+            /XF @excluded /XD ue4ss | Out-Null
         if ($LASTEXITCODE -ge 8) { throw "复制游戏文件失败（Robocopy $LASTEXITCODE）。" }
+    }
+    # 片头视频独立输出音频，测试副本从游戏主菜单启动。
+    $movies = Join-Path $copy 'EmpireBuilder\Content\Movies'
+    foreach ($name in $introMovies) {
+        $movie = Join-Path $movies $name
+        if (Test-Path -LiteralPath $movie -PathType Leaf) {
+            Move-Item -LiteralPath $movie -Destination ($movie + '.disabled') -Force
+        }
     }
     $modRoot = Join-Path $bin 'ue4ss'
     if (-not (Test-Path -LiteralPath (Join-Path $modRoot 'UE4SS.dll') -PathType Leaf) -or
