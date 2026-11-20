@@ -1,6 +1,13 @@
 ﻿param(
     [string]$GamePath,
-    [switch]$Verify
+    [switch]$Verify,
+    [switch]$Campaign,
+    [switch]$StopCampaign,
+    [switch]$SteamSave,
+    [switch]$Visible,
+    [switch]$Resume,
+    [ValidatePattern('^run-[0-9a-f]{32}$')][string]$ReviewedRun,
+    [ValidatePattern('^0[1-4]/LVL\w+$')][string]$Trial
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,8 +53,10 @@ function Install-Assistant([string]$source) {
     $copy = Join-Path $runtime 'game'
     $bin = Join-Path $copy $relativeBin
     New-Item -ItemType Directory -Path $copy -Force | Out-Null
-    & robocopy.exe $source $copy /E /XJ /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
-    if ($LASTEXITCODE -ge 8) { throw "复制游戏文件失败（Robocopy $LASTEXITCODE）。" }
+    if ([IO.Path]::GetFullPath($source).TrimEnd('\') -ne [IO.Path]::GetFullPath($copy).TrimEnd('\')) {
+        & robocopy.exe $source $copy /E /XJ /COPY:DAT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
+        if ($LASTEXITCODE -ge 8) { throw "复制游戏文件失败（Robocopy $LASTEXITCODE）。" }
+    }
     $modRoot = Join-Path $bin 'ue4ss'
     if (-not (Test-Path -LiteralPath (Join-Path $modRoot 'UE4SS.dll') -PathType Leaf) -or
         -not (Test-Path -LiteralPath (Join-Path $bin 'dwmapi.dll') -PathType Leaf)) {
@@ -78,11 +87,42 @@ function Set-AssistantState([string]$state) {
     [IO.File]::WriteAllText($file, ([guid]::NewGuid().ToString('N') + ' ' + $state))
 }
 
-function Start-Game([string]$source) {
+function Get-SteamCampaignProfile {
+    if (Get-Process -Name 'EmpireBuilder','EmpireBuilder-Win64-Shipping' -ErrorAction SilentlyContinue) {
+        throw '河畔小镇已在运行。请退出游戏后再从 Steam 存档续打。'
+    }
+    $saveDir = Join-Path ([Environment]::GetFolderPath('UserProfile')) 'AppData\Local\EmpireBuilder\Saved\SaveGames'
+    if (-not (Test-Path -LiteralPath (Join-Path $saveDir 'SGSaveLevelData.sav') -PathType Leaf)) {
+        throw "找不到 Steam 正式存档 $saveDir"
+    }
+    $profile = Join-Path $runtime 'steam-profile'
+    $parent = Join-Path $profile 'Saved'
+    $link = Join-Path $parent 'SaveGames'
+    $existing = Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue
+    if ($existing) {
+        if ($existing.LinkType -ne 'Junction' -or [string]$existing.Target -ne $saveDir) {
+            throw "Steam 闯关目录未指向正式存档 $link"
+        }
+    } else {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+        New-Item -ItemType Junction -Path $link -Target $saveDir | Out-Null
+    }
+    return $profile
+}
+
+function Start-Game([string]$source, [string]$seedSave) {
+    $steamProfile = if ($SteamSave) { Get-SteamCampaignProfile }
     $bin = Install-Assistant $source
     $script:sessionDir = Join-Path $runtime ('run-' + [guid]::NewGuid().ToString('N'))
-    $profile = if ($Verify) { Join-Path $script:sessionDir 'profile' } else { Join-Path $runtime 'profile' }
+    $profile = if ($steamProfile) { $steamProfile }
+        elseif ($Verify -or $Trial) { Join-Path $script:sessionDir 'profile' }
+        else { Join-Path $runtime 'profile' }
     New-Item -ItemType Directory -Path $script:sessionDir,$profile -Force | Out-Null
+    if ($seedSave) {
+        $saveDir = Join-Path $profile 'Saved\SaveGames'
+        New-Item -ItemType Directory -Path $saveDir -Force | Out-Null
+        Copy-Item -LiteralPath $seedSave -Destination $saveDir
+    }
     Set-AssistantState 'run'
     $env:RIVER_ASSISTANT_SESSION = $script:sessionDir
     $env:RIVER_ASSISTANT_SOURCE = Join-Path $PSScriptRoot 'mod'
@@ -90,10 +130,11 @@ function Start-Game([string]$source) {
         '-NoSplash', '-windowed', '-dx11', '-NoSteam', "-UserDir=`"$profile`"",
         '"-ini:Engine:[OnlineSubsystem]:DefaultPlatformService=Null,[OnlineSubsystemSteam]:bEnabled=false"'
     )
-    if ($Verify) {
+    if ($Verify -or $Campaign -or $Trial) {
         $arguments += @('-nosound', '-unattended', '-ResX=960', '-ResY=540')
+        $windowStyle = if ($Visible) { 'Normal' } else { 'Hidden' }
         $script:gameProcess = Start-Process -FilePath (Join-Path $bin $exeName) -WorkingDirectory $bin `
-            -ArgumentList $arguments -WindowStyle Hidden -PassThru
+            -ArgumentList $arguments -WindowStyle $windowStyle -PassThru
     } else {
         $script:gameProcess = Start-Process -FilePath (Join-Path $bin $exeName) -WorkingDirectory $bin `
             -ArgumentList $arguments -PassThru
@@ -255,18 +296,34 @@ function Show-Assistant([string]$source) {
     $form.Dispose()
 }
 
+$modes = @([bool]$Verify, [bool]$Campaign, [bool]$StopCampaign, [bool]$Trial) | Where-Object { $_ }
+if (@($modes).Count -gt 1 -or (($Resume -or $ReviewedRun) -and -not $Campaign)) {
+    throw '请选择一种启动模式。续跑和复盘记录用于全三星模式。'
+}
+if ($SteamSave -and -not ($Campaign -or $StopCampaign)) {
+    throw 'Steam 存档用于启动或停止全三星闯关。'
+}
+if ($Campaign -or $Trial -or $StopCampaign) { . (Join-Path $PSScriptRoot 'Campaign.ps1') }
+if ($StopCampaign) { Request-CampaignStop; return }
+
 $mutex = New-Object Threading.Mutex($false, 'Local\RiverTownsAssistant')
 $ownsMutex = $false
 try {
     try { $ownsMutex = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $ownsMutex = $true }
     if (-not $ownsMutex) { throw '河畔小镇闯关助手已经在运行。' }
+    if (-not $GamePath -and ($Campaign -or $Trial)) {
+        $copy = Join-Path $runtime 'game'
+        if (Test-Path -LiteralPath (Join-Path $copy "$relativeBin\$exeName") -PathType Leaf) { $GamePath = $copy }
+    }
     if (-not $GamePath) { $GamePath = Find-Game }
-    if ($Verify) { Test-Assistant $GamePath } else { Show-Assistant $GamePath }
+    if ($Campaign -or $Trial) { Invoke-Campaign $GamePath }
+    elseif ($Verify) { Test-Assistant $GamePath }
+    else { Show-Assistant $GamePath }
 } finally {
     if ($gameProcess -and -not $gameProcess.HasExited) {
         Set-AssistantState 'pause'
         [void]$gameProcess.CloseMainWindow()
-        if ($Verify -and -not $gameProcess.WaitForExit(3000)) { $gameProcess.Kill() }
+        if (($Verify -or $Campaign -or $Trial) -and -not $gameProcess.WaitForExit(5000)) { $gameProcess.Kill() }
     }
     if ($ownsMutex) { $mutex.ReleaseMutex() }
     $mutex.Dispose()
