@@ -89,16 +89,24 @@ function Get-LiveLevels {
     }
 }
 
+function Get-LiveAchievements {
+    Get-Content -LiteralPath (Join-Path $PSScriptRoot 'mod\achievements.tsv') -Encoding UTF8 | ForEach-Object {
+        $id, $level, $label, $condition = $_ -split "`t", 4
+        [pscustomobject]@{ Id = $id; Level = $level; Label = $label; Condition = $condition }
+    }
+}
+
 function Read-LiveStatus([string]$session) {
     $path = Join-Path $session 'status.tsv'
     try {
         $updated = [IO.File]::GetLastWriteTimeUtc($path)
         $fields = [IO.File]::ReadAllText($path).TrimEnd([char[]]"`r`n") -split "`t"
-        if ($fields.Count -ne 12 -or $fields[8] -notmatch '^\d+-[0-9a-f]+$') { return }
+        if ($fields.Count -notin 12,14 -or $fields[8] -notmatch '^\d+-[0-9a-f]+$') { return }
         [pscustomobject]@{
             Phase = $fields[0]; Level = $fields[1]; Score = $fields[2]; Remaining = $fields[3]; Cleared = $fields[4]
             Stars = $fields[5]; Threshold = $fields[6]; Detail = $fields[7]; Bridge = $fields[8]; Current = $fields[9]
             Serial = $fields[10]; Job = $fields[11]; Updated = $updated
+            AchievementSupport = $fields.Count -eq 14; Achievement = $fields[12]; AchievementProgress = $fields[13]
         }
     } catch [IO.IOException] { return }
 }
@@ -126,15 +134,18 @@ function Show-LiveAssistant([string]$source) {
     $bin = if ($source) { Join-Path ([IO.Path]::GetFullPath($source)) $relativeBin }
     $session = Join-Path $runtime 'live'
     $levels = @(Get-LiveLevels)
+    $achievements = @(Get-LiveAchievements)
     $byLevel = @{}
     foreach ($level in $levels) { $byLevel[$level.Level] = $level }
+    $byAchievement = @{}
+    foreach ($achievement in $achievements) { $byAchievement[$achievement.Id] = $achievement }
     $ui = [pscustomobject]@{
         GameId = $null; State = $null; Request = $null; Error = ''; Installed = (Test-LiveBridge $bin)
     }
 
     $form = New-Object Windows.Forms.Form
     $form.Text = '河畔小镇闯关助手'
-    $form.ClientSize = New-Object Drawing.Size(568, 250)
+    $form.ClientSize = New-Object Drawing.Size(568, 322)
     $form.StartPosition = 'CenterScreen'
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false
@@ -148,9 +159,9 @@ function Show-LiveAssistant([string]$source) {
     $stats = New-Object Windows.Forms.Label
     $stats.SetBounds(20, 50, 528, 42)
     $hint = New-Object Windows.Forms.Label
-    $hint.SetBounds(20, 190, 528, 48)
+    $hint.SetBounds(20, 269, 528, 42)
     $setup = New-Object Windows.Forms.Button
-    $setup.SetBounds(20, 207, 146, 30)
+    $setup.SetBounds(20, 273, 146, 30)
     $setup.Text = '安装连接组件'
     $setup.Visible = $false
 
@@ -172,8 +183,24 @@ function Show-LiveAssistant([string]$source) {
     $single = New-Object Windows.Forms.Button
     $single.SetBounds(420, 144, 128, 36)
     $single.Text = '闯指定关'
-    foreach ($control in @($first, $current, $stop, $levelsBox, $single)) { $control.Enabled = $false }
-    $form.Controls.AddRange(@($status, $stats, $hint, $first, $current, $stop, $levelsBox, $single, $setup))
+    $achievementBox = New-Object Windows.Forms.ComboBox
+    $achievementBox.SetBounds(20, 197, 372, 31)
+    $achievementBox.DropDownStyle = 'DropDownList'
+    $achievementBox.AccessibleName = '指定成就'
+    $achievementBox.Items.AddRange([object[]]$achievements.Label)
+    $achievementBox.SelectedIndex = 0
+    $challenge = New-Object Windows.Forms.Button
+    $challenge.SetBounds(420, 193, 128, 36)
+    $challenge.Text = '挑战成就'
+    $condition = New-Object Windows.Forms.Label
+    $condition.SetBounds(20, 234, 528, 32)
+    $condition.Text = $achievements[0].Condition
+    $achievementBox.Add_SelectedIndexChanged({
+        $condition.Text = $achievements[$achievementBox.SelectedIndex].Condition
+    })
+    foreach ($control in @($first, $current, $stop, $levelsBox, $single, $achievementBox, $challenge)) { $control.Enabled = $false }
+    $form.Controls.AddRange(@($status, $stats, $hint, $first, $current, $stop, $levelsBox, $single,
+        $achievementBox, $challenge, $condition, $setup))
 
     $phaseLabels = @{
         idle='已连接 Steam 游戏'; ready='正在准备闯关'; loading='正在加载游戏地图'; travel='正在切换关卡'
@@ -198,6 +225,11 @@ function Show-LiveAssistant([string]$source) {
         'stopped'='可以继续手动操作游戏。'
         'single'='指定关已结算。'
         'retry'='本关再试一局。'
+        'achievement-earned'='游戏已触发成就的解锁判定。'
+        'achievement-already-earned'='Steam 已记录这项成就。'
+        'achievement-retry'='本局未达成成就条件，正在重新挑战。'
+        'achievement-missed'='两局均未触发成就判定，已停在结算画面。'
+        'achievement-observer-unavailable'='当前游戏版本的成就判定无法读取。'
     }
     $send = {
         param([string]$action, [string]$level = '')
@@ -206,12 +238,13 @@ function Show-LiveAssistant([string]$source) {
         $ui.Error = ''
         try { Write-LiveRequest $session $ui.Request } catch [IO.IOException] { $ui.Error = '正在重试发送指令。' }
         $status.Text = if ($action -eq 'stop') { '正在停止闯关' } else { '正在发送闯关指令' }
-        $first.Enabled = $current.Enabled = $single.Enabled = $levelsBox.Enabled = $false
+        $first.Enabled = $current.Enabled = $single.Enabled = $levelsBox.Enabled = $achievementBox.Enabled = $challenge.Enabled = $false
         $stop.Enabled = $action -ne 'stop'
     }
     $first.Add_Click({ & $send 'first' })
     $current.Add_Click({ & $send 'current' $ui.State.Current })
     $single.Add_Click({ if ($levelsBox.SelectedIndex -ge 0) { & $send 'single' $levels[$levelsBox.SelectedIndex].Level } })
+    $challenge.Add_Click({ & $send 'achievement' $achievements[$achievementBox.SelectedIndex].Id })
     $stop.Add_Click({ & $send 'stop' })
     $setup.Add_Click({
         try {
@@ -254,6 +287,7 @@ function Show-LiveAssistant([string]$source) {
         $current.Enabled = $canStart -and [bool]$state.Current
         $single.Enabled = $canStart -and $levelsBox.SelectedIndex -ge 0
         $levelsBox.Enabled = $canStart
+        $achievementBox.Enabled = $challenge.Enabled = $canStart -and $state.AchievementSupport
         $stop.Enabled = ($active -or $pending) -and -not ($ui.Request -and $ui.Request.Action -eq 'stop')
         $setup.Visible = $bin -and -not $ui.Installed -and -not $process
         $setup.Enabled = $setup.Visible
@@ -272,17 +306,23 @@ function Show-LiveAssistant([string]$source) {
             }
             return
         }
+        $goal = if ($state.Achievement -and $byAchievement.ContainsKey($state.Achievement)) { $byAchievement[$state.Achievement] }
         $status.Text = if ($pending) {
             if ($ui.Request.Action -eq 'stop') { '正在停止闯关' } else { '正在发送闯关指令' }
-        } elseif ($phaseLabels.ContainsKey($state.Phase)) { $phaseLabels[$state.Phase] } else { '已连接 Steam 游戏' }
+        } elseif ($goal -and $active) { "正在挑战 $($goal.Label)" }
+            elseif ($goal -and $state.Phase -eq 'finished') { "成就目标已完成 · $($goal.Label)" }
+            elseif ($phaseLabels.ContainsKey($state.Phase)) { $phaseLabels[$state.Phase] } else { '已连接 Steam 游戏' }
         $levelLabel = if ($state.Level -and $byLevel.ContainsKey($state.Level)) { $byLevel[$state.Level].Label }
             elseif ($state.Current -and $byLevel.ContainsKey($state.Current)) { $byLevel[$state.Current].Label }
         $stats.Text = if ($state.Threshold -and $levelLabel) {
             "$levelLabel`r`n得分 $($state.Score) / $($state.Threshold)（三星）　剩余拼块 $($state.Remaining)"
         } elseif ($levelLabel) { $levelLabel } else { '可从头闯关，或在下拉列表选择关卡。' }
         $hint.Text = if ($ui.Error) { $ui.Error }
+            elseif ($goal -and $active -and $state.AchievementProgress) { $state.AchievementProgress }
             elseif ($messages.ContainsKey($state.Detail)) { $messages[$state.Detail] }
             elseif ($state.Phase -eq 'blocked') { $state.Detail }
+            elseif ($goal -and $active) { $goal.Condition }
+            elseif (-not $state.AchievementSupport) { '重开游戏后可使用成就挑战。' }
             elseif ($active) { "本轮已结算 $($state.Cleared) 关" }
             elseif (-not $state.Current) { '在游戏中进入关卡或在选关地图上选中关卡后，可从当前关卡开始。' }
             elseif ($state.Phase -eq 'idle' -and $state.Threshold) { '从当前关卡开始会接着摆放棋盘上的剩余拼块。' }

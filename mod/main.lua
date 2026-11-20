@@ -4,6 +4,7 @@ if type(settings) ~= "table" then settings = {} end
 local session = assert(settings.session or os.getenv("RIVER_ASSISTANT_SESSION"), "Missing assistant session")
 local source = assert(settings.source or os.getenv("RIVER_ASSISTANT_SOURCE"))
 local live = settings.live and dofile(source .. "/live.lua").connect(session, source .. "/levels.tsv") or nil
+local achievements = live and dofile(source .. "/achievements.lua").load(source .. "/achievements.tsv") or nil
 local solver = dofile(source .. "/solver.lua")
 local probe_path = not live and os.getenv("RIVER_ASSISTANT_PROBE")
 local probe = probe_path and probe_path ~= "" and dofile(probe_path) or nil
@@ -89,6 +90,8 @@ local function write_status()
     }
     if live then
         fields[9], fields[10], fields[11], fields[12] = live.id, live.current, live.serial, live.job and live.job.kind or ""
+        fields[13] = live.achievement or ""
+        fields[14] = achievements.attempt and achievements.attempt.progress or ""
     end
     local data = table.concat(fields, "\t")
     local now = os.time()
@@ -126,7 +129,7 @@ local function read_command()
 end
 
 local function fail(message)
-    if live then live.job = nil end
+    if live then live.job, achievements.attempt = nil, nil end
     phase, detail, command = "blocked", message, "pause"
     event("blocked", current_level, tostring(message):gsub("[\t\r\n]", " "))
 end
@@ -164,8 +167,10 @@ local function classify(descriptor, actor)
     local treasure = label:find("treasure") ~= nil or label:find("gold") ~= nil
     local crumbling = label:find("buildingmaterials") ~= nil
     local ruin_floors
-    if crumbling and present(actor) and type(actor.Floors) == "number" and type(actor.FloorsSquished) == "number" then
-        ruin_floors = math.max(1, actor.Floors - actor.FloorsSquished)
+    if crumbling and present(actor) and actor.IsRemoved ~= true
+            and type(actor.Floors) == "number" and type(actor.FloorsSquished) == "number" then
+        local floors = actor.Floors - actor.FloorsSquished
+        if floors > 0 then ruin_floors = floors end
     end
     if treasure then cover = 10
     elseif crumbling then cover = 30
@@ -639,8 +644,29 @@ local function expect_live_map(number)
     live.job.deadline = os.time() + 25
 end
 
+local function achievement_done(message)
+    phase, detail, live.job = "finished", message, nil
+    event("achievement", current_level, live.achievement)
+    achievements.attempt = nil
+end
+
 local function finish_live_level(screen, recorded_stars)
     local job = live.job
+    if job.achievement then
+        if achievements.attempt.earned then
+            achievement_done("achievement-earned")
+        elseif attempts[current_level] >= 2 then
+            phase, detail, live.job = "paused", "achievement-missed", nil
+            achievements.attempt = nil
+            event("achievement-missed", current_level, job.achievement)
+        else
+            job.stage, achievements.attempt = "route", nil
+            expect_live_map(selected.world)
+            return_to_map(screen)
+            detail = "achievement-retry"
+        end
+        return
+    end
     if recorded_stars >= 3 then
         if job.kind == "single" or job.index == #live.levels then
             phase, detail, live.job = "finished", job.kind, nil
@@ -761,10 +787,16 @@ local function play(world, controller)
             return
         end
     end
+    local achievement = achievements and achievements.attempt
+    if achievement and achievement.id == "ACH_NICE" and achievement.earned then
+        achievement_done("achievement-earned")
+        return
+    end
     if remaining == 0 then return end
     local piece = get_piece(grid, descriptor)
     if not piece then fail("shape-unavailable"); return end
     local upcoming, has_single = {}, #piece.rotations[1] == 1
+    local deck = achievement and {piece}
     local castle = current_level == "LVL_CastleIsland"
     local church_island = current_level == "LVL_ChurchIsland"
     local nexus = current_level == "LVL09_Nexus"
@@ -790,6 +822,7 @@ local function play(world, controller)
     local remaining_connectors = 0
     for i = 1, remaining - 1 do
         local future = get_piece(grid, unwrap(stack[remaining - i]))
+        if deck then deck[i + 1] = future or false end
         if future then
             if i <= lookahead then upcoming[#upcoming + 1] = future end
             local sz = #future.rotations[1]
@@ -805,7 +838,7 @@ local function play(world, controller)
             end
         end
     end
-    local board = get_board(grid, tainted_vault or river_heart)
+    local board = get_board(grid, tainted_vault or river_heart or (achievement and achievement.id == "ACH_CORRUPTION"))
     board.objective_focus = castle or church_island or nexus or compact or dense_city or corruption_crates
     board.bridge_focus = compact
     board.large_tree_focus = tree_route or tree_fort or river_heart
@@ -975,7 +1008,26 @@ local function play(world, controller)
         return grid:CanPlaceShape(descriptor, placement(option.x, option.y, option.rotation), {}) == 0
     end
     local planned
-    if probe and probe.pick_move and selected and not piece.sapling then
+    if achievement then
+        if achievement.id == "ACH_BRIDGES" then
+            for _, item in ipairs(scoring:GetAddScoringFunctions() or {}) do
+                local rule = unwrap(item)
+                if present(rule) and object_name(rule:GetClass()) == "SF_Add_Bridges_C" then
+                    achievement.progress = string.format("已架桥 %d / 30", (rule.Score or 0) // 2)
+                    break
+                end
+            end
+        end
+        local legal_last
+        if achievement.id == "ACH_CORRUPTION" then
+            local last = unwrap(stack[1])
+            legal_last = function(option)
+                return present(last) and grid:CanPlaceShape(last, placement(option.x, option.y, option.rotation), {}) == 0
+            end
+        end
+        local move, handled = achievements.choose(achievement, board, piece, deck, solver, legal, legal_last)
+        if handled then planned = move or "discard" end
+    elseif probe and probe.pick_move and selected and not piece.sapling then
         local ok, value = pcall(probe.pick_move, session, current_level, selected.number,
             object_name(descriptor), remaining, board, piece, legal, scoring)
         if ok then planned = value end
@@ -1034,6 +1086,7 @@ local function stop_live(controller, reason)
         if present(cursor) then cursor:SetIsPlacePressed(false) end
     end
     live.job, pending, selected = nil, nil, nil
+    achievements.attempt = nil
     phase, detail = "paused", reason
     event("stopped", current_level, reason)
 end
@@ -1060,16 +1113,23 @@ local function inspect_live_page(world, controller, playable)
 end
 
 local function begin_live_job(action, target, world, controller, playable)
-    local entry = action == "first" and live.levels[1] or live.by_name[target]
-    if action ~= "first" and action ~= "current" and action ~= "single" then return end
+    if action ~= "first" and action ~= "current" and action ~= "single" and action ~= "achievement" then return end
+    local achievement = action == "achievement" and target or nil
+    local level = achievement and achievements.catalog[achievement] or target
+    local entry = action == "first" and live.levels[1] or live.by_name[level]
     if action == "current" and target ~= live.current then fail("live-current-changed"); return end
     if not entry then fail("live-target-missing"); return end
     if live.job then stop_live(controller, "stopped") end
+    live.achievement, achievements.attempt = achievement, nil
+    if achievement then
+        if achievements.unlocked(world, controller, achievement) then achievement_done("achievement-already-earned"); return end
+        if not achievements:watch() then fail("achievement-observer-unavailable"); return end
+    end
     attempts, cleared, cleared_count = {}, {}, 0
     pending, selected, failed_moves, stall_count, end_started, gate_pending = nil, nil, {}, 0, nil, false
     local adopt = action == "current" and playable and entry.level == current_level
         and present(world.AuthorityGameMode) and world.AuthorityGameMode.bHasGameEnded ~= true
-    live.job = {kind = action, index = entry.index, stage = adopt and "play" or "route"}
+    live.job = {kind = action, index = entry.index, stage = adopt and "play" or "route", achievement = achievement}
     phase, detail = "ready", action
     if adopt then
         attempts[current_level] = 1
@@ -1136,7 +1196,9 @@ local function live_step()
         return
     end
     local changed = observe_world(world)
-    if not live.job and (changed or phase == "waiting") then phase, detail = "idle", "" end
+    if not live.job and (changed or phase == "waiting") then
+        phase, detail, live.achievement = "idle", "", nil
+    end
     local playable = object_name(controller:GetClass()) == "PlayerController_EmpireBuilder_C"
     inspect_live_page(world, controller, playable)
     if serial and serial ~= live.serial then
@@ -1157,6 +1219,7 @@ local function live_step()
     local entry = live.levels[job.index]
     if job.stage == "play" then
         if not playable or current_level ~= entry.level then fail("live-game-changed"); return end
+        if job.achievement and not achievements.attempt then achievements.attempt = {id = job.achievement} end
         play(world, controller)
     else
         route_live(world, controller, entry)

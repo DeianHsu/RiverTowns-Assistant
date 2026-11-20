@@ -19,12 +19,16 @@ end
 
 function Live:request()
     local file = io.open(self.session .. "/command.tsv", "r")
-    if not file then return end
-    local line = file:read("*l") or ""
-    file:close()
-    local id, serial, until_time, action, target = line:match("^(%S+)\t(%x+)\t(%d+)\t(%a+)\t([%w_]*)$")
-    if id == self.id and tonumber(until_time) >= os.time() then
-        return serial, action, target
+    if file then
+        local line = file:read("*l") or ""
+        file:close()
+        local id, serial, until_time, action, target = line:match("^(%S+)\t(%x+)\t(%d+)\t(%a+)\t([%w_]*)$")
+        if id == self.id then self.command = {serial = serial, action = action, target = target, expiry = tonumber(until_time)} end
+    end
+    -- Windows 替换指令文件时，沿用最近一次有效指令直至它过期。
+    local command = self.command
+    if command and command.expiry >= os.time() then
+        return command.serial, command.action, command.target
     end
 end
 

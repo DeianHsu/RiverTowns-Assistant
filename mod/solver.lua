@@ -1251,6 +1251,10 @@ local function choose_sapling(board, neighbors, piece, legal)
     return best
 end
 
+function Solver.placements(board, piece)
+    return geometry(board, make_neighbors(board.width, board.height), piece)
+end
+
 -- 对接下来的几块实际拼块做束搜索，每次用游戏校验首步。
 function Solver.choose(board, piece, upcoming, attempt, legal, native_score)
     local neighbors = make_neighbors(board.width, board.height)
