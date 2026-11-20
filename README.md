@@ -4,20 +4,34 @@
 
 ## 安装与启动
 
-1. 在 Steam 安装游戏，并下载或克隆本项目。
-2. 首次使用时，关闭游戏，双击 `Start.cmd`，点击 **安装连接组件**。助手会在 Steam 游戏目录中安装 UE4SS v4.0.0 加载器。
-3. 从 Steam 启动游戏，再双击 `Start.cmd`。连接成功后，即可在助手窗口选择任务。
+1. 在 Steam 安装游戏，在 Windows 10/11（x64）上双击 `RiverTownsAssistant.exe` 打开助手。
+2. 首次使用时，关闭游戏，点击 **安装连接组件**。应用内置 UE4SS v4.0.0 加载器，可以离线安装。
+3. 从 Steam 启动游戏。助手连接成功后，即可在窗口中选择任务。
 
 自动查找失败时，可指定包含 `EmpireBuilder.exe` 的游戏安装目录。
+
+```powershell
+.\RiverTownsAssistant.exe -GamePath "<游戏安装目录>"
+```
+
+应用的运行文件位于 `%LOCALAPPDATA%\RiverTownsAssistant\.river-runtime`，可以单独移动 `.exe`。从源码版迁移时，关闭游戏，在独立应用中点击 **安装连接组件** 即可切换连接。加载器在游戏的 `EmpireBuilder/Binaries/Win64` 目录中使用 `dwmapi.dll` 和 `override.txt`，关闭游戏后可移除助手安装的这两个文件来卸载连接组件。
+
+### 从源码运行与构建
+
+从源码打开窗口时，双击 `Start.cmd`，或在 PowerShell 中指定游戏目录。
 
 ```powershell
 .\Start.cmd -InstallSteamBridge -GamePath "<游戏安装目录>"
 .\Start.cmd -GamePath "<游戏安装目录>"
 ```
 
-连接组件的运行文件位于项目内的 `.river-runtime/live-bridge`。加载器在游戏的 `EmpireBuilder/Binaries/Win64` 目录中使用 `dwmapi.dll` 和 `override.txt`。关闭游戏后，移除本项目安装的这两个文件即可卸载连接组件。移动项目目录后，可用相同步骤移除旧加载器，再从新位置安装。
+源码版的运行文件位于项目内的 `.river-runtime`。使用 Windows PowerShell 构建独立应用，产物为 `dist/RiverTownsAssistant.exe`。
 
-如果自动下载失败，将官方发行包 `UE4SS_v4.0.0.zip` 放进 `.river-runtime` 后重试。[UE4SS 官方发行页](https://github.com/UE4SS-RE/RE-UE4SS/releases/tag/v4.0.0)
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build-App.ps1
+```
+
+构建和源码版安装会优先使用 `.river-runtime` 中的 UE4SS 压缩包。如果自动下载失败，将官方发行包 `UE4SS_v4.0.0.zip` 放进该目录后重试。[UE4SS 官方发行页](https://github.com/UE4SS-RE/RE-UE4SS/releases/tag/v4.0.0)
 
 ## 窗口操作
 
@@ -60,7 +74,7 @@ Steam 存档的闯关可在复盘后用 `.\Start.cmd -Campaign -SteamSave -Resum
 
 ## 日志与验证
 
-- 窗口任务的事件记录位于 `.river-runtime/live/events.tsv`。
+- 窗口任务的事件记录位于各自运行目录下的 `live/events.tsv`。
 - 命令行结算记录位于 `.river-runtime/run-*/events.tsv`，全三星断点分别位于 `.river-runtime/campaign/state.json` 和 `.river-runtime/campaign-steam/state.json`。
 - `.\Start.cmd -Verify` 使用静音隔离存档，检查自动摆放、结算和连续选关。
 - `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Campaign.Tests.ps1` 检查结算计数、断点和复盘续跑条件。

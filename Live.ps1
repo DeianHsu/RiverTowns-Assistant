@@ -19,6 +19,16 @@ function Test-LiveBridge([string]$bin) {
         ([IO.File]::ReadAllText($override, [Text.Encoding]::Default).Trim() -eq $directory)
 }
 
+function Test-AssistantBridge([string]$directory) {
+    if ($directory -like '*\UE4SS.dll') { $directory = [IO.Path]::GetDirectoryName($directory) }
+    if ($directory -notlike '*\.river-runtime\live-bridge\ue4ss') { return $false }
+    $mods = Join-Path $directory 'Mods'
+    $list = Join-Path $mods 'mods.txt'
+    (Test-Path -LiteralPath (Join-Path $mods 'RiverTownsLive\Scripts\main.lua') -PathType Leaf) -and
+        (Test-Path -LiteralPath $list -PathType Leaf) -and
+        ([IO.File]::ReadAllText($list).Trim() -eq 'RiverTownsLive : 1')
+}
+
 function ConvertTo-LuaPath([string]$path) {
     $escaped = [Text.Encoding]::Default.GetBytes($path) | ForEach-Object { '\{0:D3}' -f $_ }
     '"' + ($escaped -join '') + '"'
@@ -30,7 +40,7 @@ function New-LiveBridgeRuntime([string]$bridge, [string]$session) {
     $proxy = Join-Path $bridge 'dwmapi.dll'
     if (-not (Test-Path -LiteralPath (Join-Path $modRoot 'UE4SS.dll') -PathType Leaf) -or
         -not (Test-Path -LiteralPath $proxy -PathType Leaf)) {
-        Expand-Archive -LiteralPath (Get-UE4SSArchive) -DestinationPath $bridge -Force
+        Expand-Archive -LiteralPath (Get-UE4SSArchive $runtime) -DestinationPath $bridge -Force
     }
     $mods = Join-Path $modRoot 'Mods'
     $scripts = Join-Path $mods 'RiverTownsLive\Scripts'
@@ -58,8 +68,9 @@ function Install-SteamBridge([string]$source) {
     $configured = if (Test-Path -LiteralPath $override -PathType Leaf) {
         [IO.File]::ReadAllText($override, [Text.Encoding]::Default).Trim()
     }
-    $oldPath = Join-Path $directory 'UE4SS.dll'
-    if ($configured -notin $directory,$oldPath -and
+    $migrate = $configured -eq (Join-Path $directory 'UE4SS.dll') -or
+        ($configured -ne $directory -and (Test-AssistantBridge $configured))
+    if ($configured -ne $directory -and -not $migrate -and
             ((Test-Path -LiteralPath $override) -or (Test-Path -LiteralPath $proxy) -or
             (Test-Path -LiteralPath (Join-Path $bin 'ue4ss')) -or (Test-Path -LiteralPath (Join-Path $bin 'UE4SS.dll')))) {
         throw 'Steam 游戏目录中已有加载组件，需要先解决加载配置冲突。'
@@ -68,7 +79,7 @@ function Install-SteamBridge([string]$source) {
     New-LiveBridgeRuntime $bridge (Join-Path $runtime 'live')
     # UE4SS 会在 override.txt 指定的目录下查找 UE4SS.dll。
     $bytes = [Text.Encoding]::Default.GetBytes($directory)
-    if ($configured -eq $oldPath) {
+    if ($migrate) {
         [IO.File]::WriteAllBytes($override, $bytes)
     } elseif ($configured -ne $directory) {
         $file = [IO.File]::Open($override, [IO.FileMode]::CreateNew)

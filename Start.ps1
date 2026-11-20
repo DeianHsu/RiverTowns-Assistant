@@ -13,12 +13,11 @@
 
 $ErrorActionPreference = 'Stop'
 $runtime = Join-Path $PSScriptRoot '.river-runtime'
-$releaseName = 'UE4SS_v4.0.0.zip'
-$releaseHash = '251ad0d1381a241750e036f5918cbf2b5d7ec58ebc608cb2dd09d459d0c81e45'
 $exeName = 'EmpireBuilder-Win64-Shipping.exe'
 $relativeBin = 'EmpireBuilder\Binaries\Win64'
 $gameProcess = $null
 $sessionDir = $null
+. (Join-Path $PSScriptRoot 'UE4SS.ps1')
 
 function Find-Game {
     $roots = @(
@@ -47,23 +46,6 @@ function Find-Game {
     }
 }
 
-function Get-UE4SSArchive {
-    New-Item -ItemType Directory -Path $runtime -Force | Out-Null
-    $zip = Join-Path $runtime $releaseName
-    if (-not (Test-Path -LiteralPath $zip -PathType Leaf)) {
-        & curl.exe --fail --silent --show-error --location --connect-timeout 12 --max-time 120 `
-            --output ($zip + '.part') "https://github.com/UE4SS-RE/RE-UE4SS/releases/download/v4.0.0/$releaseName"
-        if ($LASTEXITCODE -ne 0) {
-            throw "下载 UE4SS 失败。请将官方 $releaseName 放到 $runtime 后重试。"
-        }
-        Move-Item -LiteralPath ($zip + '.part') -Destination $zip
-    }
-    if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash -ne $releaseHash) {
-        throw 'UE4SS 压缩包校验失败，请换用官方 v4.0.0 发行包。'
-    }
-    return $zip
-}
-
 function Install-Assistant([string]$source) {
     if (-not $source -or -not (Test-Path -LiteralPath (Join-Path $source "$relativeBin\$exeName") -PathType Leaf)) {
         throw '请选择 Steam 安装的河畔小镇目录。该目录包含 EmpireBuilder.exe。'
@@ -89,7 +71,7 @@ function Install-Assistant([string]$source) {
     $modRoot = Join-Path $bin 'ue4ss'
     if (-not (Test-Path -LiteralPath (Join-Path $modRoot 'UE4SS.dll') -PathType Leaf) -or
         -not (Test-Path -LiteralPath (Join-Path $bin 'dwmapi.dll') -PathType Leaf)) {
-        Expand-Archive -LiteralPath (Get-UE4SSArchive) -DestinationPath $bin -Force
+        Expand-Archive -LiteralPath (Get-UE4SSArchive $runtime) -DestinationPath $bin -Force
     }
     $mods = Join-Path $modRoot 'Mods'
     $scripts = Join-Path $mods 'RiverAssistant\Scripts'
